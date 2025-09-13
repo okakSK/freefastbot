@@ -552,7 +552,7 @@ def notify_executors_of_order(order_id: int):
                 msg = (
                     f"🆕 Новый заказ от @{creator_username}\n <b>{safe_creator_name}</b> ({safe_creator_age} лет)\n"
                     f"{safe_description}\n"
-                    f"💰 Цена: {price} монет\n"
+                    f"💰 Цена: {price} сум\n"
                     f"📍 Расстояние: {dist_text}\n"
                     f"🆔 ID Заказа: <code>{safe_order_key}</code>\n"
                     f"/order:{_escape_html(str(order_id))}"
@@ -646,7 +646,7 @@ def expansion_job():
                             tg,
                             f"🆕 Новый заказ (расширение радиуса)\n"
                             f"{desc}\n"
-                            f"💰 Цена: {price} монет\n"
+                            f"💰 Цена: {price} сум\n"
                             f"📍 Расстояние: {dist_text}\n"
                             f"🆔 ID Заказа: `{order_key}`\n"
                             f"/order:{order_id}",
@@ -794,7 +794,7 @@ def schedule_auto_release(order_id: int):
                 try:
                     bot.send_message(
                         accepted_by,
-                        f"Деньги автоматически переведены: {frozen_amount} монет (по истечении срока).",
+                        f"Деньги автоматически переведены: {frozen_amount} сум (по истечении срока).",
                     )
                     bot.send_message(
                         creator_tg,
@@ -1498,7 +1498,7 @@ def callback_approve(call):
 
             # ------------ уведомления сторонам (не ломают транзакцию) ------------
             try:
-                bot.send_message(accepted_by, f"🎉 Заказ #{order_id} подтверждён. Вам перечислено {frozen_amount} монет.")
+                bot.send_message(accepted_by, f"🎉 Заказ #{order_id} подтверждён. Вам перечислено {frozen_amount} сум.")
             except Exception:
                 logger.exception("notify accepted_by after approve failed for order %s", order_id)
             try:
@@ -1568,7 +1568,7 @@ def cmd_order(message):
             f"@{escape(row['executor_username'] or '—')}\n"
             f"🆔 tg_id: <code>{row['accepted_by'] or '—'}</code>\n\n"
             f"📄 <b>Описание:</b> {escape(row['description'] or '')}\n"
-            f"💰 <b>Цена:</b> {row['price_coins']} монет\n"
+            f"💰 <b>Цена:</b> {row['price_coins']} сум\n"
             f"📍 <b>Локация:</b> {row['lat']},{row['lon']}\n"
             f"⚙️ <b>Статус:</b> {row['status']}"
         )
@@ -1802,7 +1802,7 @@ def handle_balance(message):
         return
     bal = u.get('balance_coins') or 0
     frozen = u.get('frozen_total_coins') or 0
-    bot.send_message(message.chat.id, f"Баланс: {bal} монет\nЗаморожено: {frozen} монет")
+    bot.send_message(message.chat.id, f"Баланс: {bal} сум\nЗаморожено: {frozen} сум")
 
 @bot.message_handler(func=lambda m: m.text == "📦 Мои заказы")
 def handle_my_orders(message):
@@ -1816,7 +1816,7 @@ def handle_my_orders(message):
             return
         for r in rows:
             key = r["order_key"] or str(r["id"])
-            bot.send_message(message.chat.id, f"#{r['id']} | {r['status']}\n{r['description']}\n{r['price_coins']} монет\nID: `{key}`", parse_mode="Markdown")
+            bot.send_message(message.chat.id, f"#{r['id']} | {r['status']}\n{r['description']}\n{r['price_coins']} сум\nID: `{key}`", parse_mode="Markdown")
     except Exception:
         logger.exception("handle_my_orders error")
         bot.send_message(message.chat.id, "Ошибка получения заказов.")
@@ -1838,7 +1838,7 @@ def handle_new_order_desc(message):
         return
     user_state_data[message.from_user.id]['description'] = text
     user_states[message.from_user.id] = "creating_order_price"
-    bot.send_message(message.chat.id, "Укажите цену в монетах (целое число):")
+    bot.send_message(message.chat.id, "Укажите цену в сумах (целое число):")
 
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "creating_order_price")
 def handle_new_order_price(message):
@@ -1871,7 +1871,7 @@ def handle_new_order_type(message):
             bot.send_message(message.chat.id, "Непонятный ввод. Отправьте локацию или нажмите 'Онлайн'.")
             return
     desc = data.get('description'); price = data.get('price'); lat = data.get('lat'); lon = data.get('lon')
-    preview = f"📌 Предпросмотр заказа\nОписание: {desc}\nЦена: {price} монет\n"
+    preview = f"📌 Предпросмотр заказа\nОписание: {desc}\nЦена: {price} сум\n"
     if lat is not None and lon is not None:
         preview += f"Адрес: lat={lat}, lon={lon}\n"
     else:
@@ -1946,7 +1946,7 @@ def list_jobs(message):
                 continue
             found += 1
             key = r["order_key"] or str(r["id"])
-            text = f"🆕 Заказ\n{r['description']}\nЦена: {r['price_coins']} монет\nID: `{key}`\n"
+            text = f"🆕 Заказ\n{r['description']}\nЦена: {r['price_coins']} сум\nID: `{key}`\n"
             if dist_text:
                 text += f"Расстояние: {dist_text}\n"
             kb = InlineKeyboardMarkup()
@@ -1970,7 +1970,7 @@ def admin_panel(message):
         bot.send_message(message.chat.id, "Доступ запрещён.")
         return
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("➕ Добавить фрилансера"), KeyboardButton("💰 Начислить монеты"))
+    kb.add(KeyboardButton("➕ Добавить фрилансера"), KeyboardButton("💰 Начислить сум"))
     kb.add(KeyboardButton("🔍 Найти пользователя"), KeyboardButton("📋 Все заказы"))
     kb.add(KeyboardButton("✏️ Изменить ФИО и Возраст"), KeyboardButton("📍 Конвертировать координаты"))
     bot.send_message(message.chat.id, "Панель администратора:", reply_markup=kb)
@@ -2071,7 +2071,7 @@ def admin_add_executor_execute(message):
     finally:
         user_states.pop(message.from_user.id, None)
 
-@bot.message_handler(func=lambda m: m.text == "💰 Начислить монеты")
+@bot.message_handler(func=lambda m: m.text == "💰 Начислить сумы")
 def admin_add_coins_prompt(message):
     if message.from_user.id not in ADMIN_IDS:
         bot.send_message(message.chat.id, "Доступ запрещён.")
@@ -2093,7 +2093,7 @@ def admin_add_coins_execute(message):
     try:
         tg = int(parts[0]); amount = int(parts[1])
         add_coins(tg, amount)
-        bot.send_message(message.chat.id, f"Начислено {amount} монет пользователю {tg}.")
+        bot.send_message(message.chat.id, f"Начислено {amount} сум пользователю {tg}.")
     except Exception:
         bot.send_message(message.chat.id, "Ошибка. Проверьте ввод.")
     finally:
@@ -2146,7 +2146,7 @@ def admin_all_orders(message):
             return
         s = "Последние заказы:\n"
         for r in rows:
-            s += f"#{r['id']} | {r['status']} | {r['price_coins']} монет | creator:{r['creator_tg']}\n{r['description']}\n\n"
+            s += f"#{r['id']} | {r['status']} | {r['price_coins']} сум | creator:{r['creator_tg']}\n{r['description']}\n\n"
         bot.send_message(message.chat.id, s)
     except Exception:
         logger.exception("admin_all_orders error")
