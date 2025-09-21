@@ -26,4 +26,5 @@ BOT_TOKEN=ВАШ_TELEGRAM_BOT_TOKEN
 ADMINS=123456789,987654321
 
 # 4. Run
+GEMINI_API_KEY = Paste_here_GEMINI_AI_API_KEY #main.py, line 34
 python3 main.py
