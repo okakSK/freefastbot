@@ -31,6 +31,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # ---------------- Config & Logging ----------------
 
 load_dotenv()
+GEMINI_API_KEY = os.getenv("Paste_here_GEMINI_AI_API_KEY", "Paste_here_GEMINI_AI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "marketplace.db")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
@@ -85,9 +86,9 @@ def gen_order_key():
     # short hex key (8 chars)
     return secrets.token_hex(4)
 
-def now_iso():
-    return datetime.utcnow().isoformat(sep=' ', timespec='seconds')
 
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(sep=' ', timespec='seconds')
 # ---------------- Haversine ----------------
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -369,6 +370,22 @@ def add_coins(tg_id: int, amount: int):
 
 def create_order_and_reserve(creator_tg: int, description: str, price: int, lat=None, lon=None, requires_photo: bool = False):
     conn = get_conn()
+
+    # normalize pending lat/lon coming from user_state_data
+    def _norm_pending_coords(v):
+        try:
+            if v is None: return None
+            if isinstance(v, (int, float)): return float(v)
+            s = str(v).strip()
+            if s == "" or s.lower() in ("none", "null"): return None
+            f = float(s)
+            return f if abs(f) > 1e-9 else None
+        except Exception:
+            return None
+
+    lat = _norm_pending_coords(lat)
+    lon = _norm_pending_coords(lon)
+
     try:
         cur = conn.cursor()
         cur.execute("BEGIN IMMEDIATE;")
@@ -465,6 +482,7 @@ def _escape_html(s: str) -> str:
              .replace(">", "&gt;"))
 
 # ---------- Notify executors about a new order ----------
+
 def notify_executors_of_order(order_id: int):
     """
     Send notifications to executors about order.
@@ -582,6 +600,8 @@ def notify_executors_of_order(order_id: int):
         logger.exception("notify_executors_of_order error")
     finally:
         conn.close()
+
+
 
 # ---------------- Scheduler tasks ----------------
 
@@ -1050,26 +1070,89 @@ def callback_complete(call):
         finally:
             conn.close()
 
+
+
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("open_dispute:"))
 def callback_open_dispute(call):
     try:
-        order_id = int(call.data.split(":",1)[1])
+        order_id = int(call.data.split(":", 1)[1])
     except Exception:
         bot.answer_callback_query(call.id, "Неверный заказ.")
         return
+
     claimant = call.from_user.id
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("INSERT INTO disputes (order_id, claimant_tg, reason) VALUES (?,?,?)", (order_id, claimant, "Opened via bot"))
-        cur.execute("UPDATE orders SET status='DISPUTE', updated_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
+        # Получаем данные по заказу
+        cur.execute("SELECT id, creator_tg, accepted_by FROM orders WHERE id=?", (order_id,))
+        row = cur.fetchone()
+        if not row:
+            bot.answer_callback_query(call.id, "Заказ не найден.")
+            return
+        _, customer_tg, executor_tg = row
+
+        # Проверяем, есть ли уже спор
+        cur.execute("SELECT id FROM disputes WHERE order_id=?", (order_id,))
+        if cur.fetchone():
+            bot.answer_callback_query(call.id, "Спор уже открыт.")
+            return
+
+        # Создаём спор
+        cur.execute(
+            "INSERT INTO disputes (order_id, claimant_tg, reason) VALUES (?,?,?)",
+            (order_id, claimant, "Opened via bot")
+        )
+        # Обновляем статус заказа
+        cur.execute(
+            "UPDATE orders SET status='DISPUTE', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (order_id,)
+        )
         conn.commit()
-        bot.answer_callback_query(call.id, "Спор создан. Администраторы уведомлены.")
+
+        # Сообщение и кнопки
+        kb = InlineKeyboardMarkup()
+        kb.add(
+            InlineKeyboardButton("👨‍💼 Связаться с админом", url="https://t.me/Komronbek_Urinboev")
+        )
+        kb.add(
+            InlineKeyboardButton("📖 Часто задаваемые вопросы", url="https://telegra.ph/Primery-spora-i-kak-ih-reshit-09-14")
+        )
+
+        msg_text = (
+            "⚖️ <b>Спор открыт</b>\n"
+            "Администраторы уведомлены."
+        )
+
+        # Уведомляем заказчика
+        if customer_tg:
+            try:
+                bot.send_message(customer_tg, msg_text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                logger.exception(f"Не удалось уведомить заказчика {customer_tg}")
+
+        # Уведомляем исполнителя
+        if executor_tg:
+            try:
+                bot.send_message(executor_tg, msg_text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                logger.exception(f"Не удалось уведомить исполнителя {executor_tg}")
+
+        # Уведомляем админов
         for admin in ADMIN_IDS:
             try:
-                bot.send_message(admin, f"Новый спор по заказу #{order_id} от {claimant}.")
+                bot.send_message(
+                    admin,
+                    f"⚠️ Новый спор по заказу #{order_id}\n"
+                    f"Открыл: {claimant}\n"
+                    f"Заказчик: {customer_tg}\n"
+                    f"Исполнитель: {executor_tg}"
+                )
             except Exception:
-                logger.exception("notify admin failed")
+                logger.exception(f"Не удалось уведомить админа {admin}")
+
+        bot.answer_callback_query(call.id, "Спор создан. Администраторы уведомлены.")
+
     except Exception:
         conn.rollback()
         logger.exception("open_dispute error")
@@ -1823,43 +1906,366 @@ def handle_my_orders(message):
     finally:
         conn.close()
 
-# New order flow (simple FSM)
+# ---- BEGIN: расширенный New order flow с Gemini и валидацией веса ----
+import os
+import re
+
+# Конфиги
+MAX_ORDER_KG = float(os.getenv("MAX_ORDER_KG", "16.0"))        # предел в кг (по умолчанию чуть >15kg)
+MAX_ORDER_LITERS = float(os.getenv("MAX_ORDER_LITERS", "20.0"))  # предел для литров (вес воды ~= литры)
+# Берём ключ из env; при желании можно временно подставить ключ как второй аргумент
+
+# Попытка подключить библиотеку google.generativeai (интерфейс genai.configure)
+GENAI_READY = False
+try:
+    import google.generativeai as genai
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        GENAI_READY = True
+    except Exception:
+        GENAI_READY = False
+        try:
+            logger.warning("genai.configure failed — Gemini disabled")
+        except NameError:
+            pass
+except Exception:
+    genai = None
+    GENAI_READY = False
+    try:
+        logger.warning("google.generativeai not installed — Gemini disabled")
+    except NameError:
+        pass
+
+# Вспомогательные функции
+PURCHASE_KEYWORDS = [
+    "купит", "купить", "покупа", "покупк", "заказ", "приобр", "хочу купить", "куплю", "приобрести"
+]
+
+def looks_like_purchase(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    for k in PURCHASE_KEYWORDS:
+        if k in t:
+            return True
+    return False
+
+def parse_number_from_text(text: str):
+    """Возвращает float или None. Ищет первое вхождение числа (разрешает запятую и пробелы как разделители тысяч)."""
+    if not text:
+        return None
+    m = re.search(r"(\d+[ \d]*[.,]?\d*)", text.replace("\u202f", " "))
+    if not m:
+        return None
+    raw = m.group(1).replace(" ", "").replace(",", ".")
+    try:
+        # если целое — вернём int, иначе float
+        if "." in raw:
+            return float(raw)
+        else:
+            return int(raw)
+    except Exception:
+        try:
+            return float(raw)
+        except Exception:
+            return None
+
+def estimate_weight_with_gemini(text: str):
+    """
+    Попытка получить оценку веса от Gemini.
+    Использует API через google.generativeai как:
+        genai.configure(api_key=...)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(prompt)
+        ответ берём из response.text или str(response)
+    Возвращает float (кг) или None (если не удалось).
+    """
+    if not GENAI_READY:
+        return None
+
+    # Строгий, но дружелюбный промпт — просим модель вернуть только число или 'UNKNOWN'
+    prompt = (
+        "Вы — маленький извлекатель. По короткому описанию задачи покупки/доставки "
+        "выпишите ТОЛЬКО оценочный вес в килограммах как число (может быть десятичное). "
+        "Ни в коем случае не добавляйте слова, единицы измерения или пояснения. "
+        "Если оценить нельзя — верните 'UNKNOWN'.\n\n"
+        f"Описание: {text}\n\nВывод:"
+    )
+
+    try:
+        # создаём модель и генерируем
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(prompt)
+
+        # Попробуем достать текст из разных возможных полей
+        resp_text = ""
+        if hasattr(response, "text") and response.text is not None:
+            resp_text = response.text
+        else:
+            # иногда объект возвращается как dict-like или с .candidates
+            try:
+                resp_text = str(response)
+            except Exception:
+                resp_text = ""
+
+        resp_text = (resp_text or "").strip()
+        if not resp_text:
+            return None
+
+        # Если модель честно ответила UNKNOWN — считаем неудачей
+        if re.search(r"\bUNKNOWN\b", resp_text, re.IGNORECASE):
+            return None
+
+        # Ищем первое число в ответе (учитываем запятую как десятичный разделитель)
+        m = re.search(r"(\d+[.,]?\d*)", resp_text)
+        if not m:
+            return None
+        val = float(m.group(1).replace(",", "."))
+        return val
+    except Exception as e:
+        try:
+            logger.exception("Gemini weight estimation failed")
+        except NameError:
+            pass
+        return None
+
+# --- FSM handlers (заменяют / расширяют ваш оригинал) ---
+
+# Минимальная цена для обычного задания
+MIN_TASK_PRICE = 4000
+
+# --- Вспомогательные функции ---
+def looks_like_delivery(text: str) -> bool:
+    """Эвристика для определения доставки."""
+    if not text:
+        return False
+    t = text.lower()
+    keywords = ["достав", "привез", "принес", "курьер", "подвез", "доставка", "доставить", "купить", "магазин"]
+    return any(k in t for k in keywords)
+
+def ask_price_message(uid, chat_id):
+    """
+    Отправляет пользователю подходящее сообщение с просьбой ввести цену:
+    - если покупка или доставка -> "цена с учётом вознаграждения/доставки"
+    - иначе -> "цена за задание (минимум MIN_TASK_PRICE)"
+    """
+    desc = (user_state_data.get(uid, {}).get('description') or "")
+    checklist = (user_state_data.get(uid, {}).get('checklist') or "")
+    combined = (desc + " " + checklist).strip()
+
+    if looks_like_purchase(combined) or looks_like_delivery(combined):
+        msg = "Укажите цену с учётом вознаграждения/доставки (числом, например: 150000):"
+    else:
+        msg = f"Укажите цену за задание (минимум {MIN_TASK_PRICE} сум):"
+
+    bot.send_message(chat_id, msg)
+
+def parse_number_from_text(text: str):
+    """Возвращает int/float или None. Ищет первое вхождение числа."""
+    if not text:
+        return None
+    m = re.search(r"(\d+[ \d]*[.,]?\d*)", text.replace("\u202f", " "))
+    if not m:
+        return None
+    raw = m.group(1).replace(" ", "").replace(",", ".")
+    try:
+        if "." in raw:
+            return float(raw)
+        else:
+            return int(raw)
+    except Exception:
+        try:
+            return float(raw)
+        except Exception:
+            return None
+
+# --- FSM: создание заказа ---
+
+# Начало создания заказа — остаётся прежним
 @bot.message_handler(func=lambda m: m.text == "➕ Новый заказ")
 def handle_new_order_start(message):
     user_states[message.from_user.id] = "creating_order_desc"
     user_state_data[message.from_user.id] = {}
     bot.send_message(message.chat.id, "Опишите задачу (коротко):")
 
+
+# Описание заказа
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "creating_order_desc")
 def handle_new_order_desc(message):
     text = (message.text or "").strip()
     if not text:
         bot.send_message(message.chat.id, "Описание не может быть пустым.")
         return
-    user_state_data[message.from_user.id]['description'] = text
-    user_states[message.from_user.id] = "creating_order_price"
-    bot.send_message(message.chat.id, "Укажите цену в сумах (целое число):")
 
+    uid = message.from_user.id
+    user_state_data.setdefault(uid, {})
+    user_state_data[uid]['description'] = text
+    user_state_data[uid]['created_at'] = now_iso()
+
+    # Если похоже на покупку — запрашиваем чек-лист
+    if looks_like_purchase(text):
+        user_states[uid] = "creating_order_checklist"
+        bot.send_message(message.chat.id,
+            "Похоже, это покупка. Напишите краткий чек-лист: магазин/бренд, количество/упаковка и (если есть) ориентировочная цена в магазине.\n\n"
+            "Пример: «Oriental Mart, 2 шт, ~12000 сум за 1» или напишите 'не знаю'."
+        )
+        return
+
+    # Иначе пробуем автоматически оценить вес
+    est = estimate_weight_with_gemini(text)
+    if est is not None:
+        user_state_data[uid]['estimated_kg'] = float(est)
+        is_liters = bool(re.search(r"\b(литр|л\b|л\.)", text.lower()))
+        limit = MAX_ORDER_LITERS if is_liters else MAX_ORDER_KG
+        if est > limit:
+            bot.send_message(message.chat.id,
+                             f"⚠️ Оценочный вес — {est:.2f} кг, что превышает допустимый лимит ({limit} кг). "
+                             "К сожалению, бот не может принять такой заказ. Попробуйте уменьшить объём или разбить заказ.")
+            user_states.pop(uid, None)
+            user_state_data.pop(uid, None)
+            return
+        # переходим к запросу цены — используем умное формирование текста
+        user_states[uid] = "creating_order_price"
+        ask_price_message(uid, message.chat.id)
+        return
+    else:
+        # не удалось: спросим вес вручную
+        user_states[uid] = "creating_order_weight"
+        bot.send_message(message.chat.id,
+                         "Не удалось автоматически определить массу. Укажите, пожалуйста, вес в килограммах (пример: 2.5) или напишите 'не знаю'.")
+
+
+# Если заказ — покупка: обработка чек-листа
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "creating_order_checklist")
+def handle_new_order_checklist(message):
+    uid = message.from_user.id
+    checklist = (message.text or "").strip()
+    if not checklist:
+        bot.send_message(message.chat.id, "Пожалуйста, дайте краткий чек-лист или напишите 'не знаю'.")
+        return
+    user_state_data.setdefault(uid, {})
+    user_state_data[uid]['checklist'] = checklist
+
+    # Комбинируем описание + чеклист и пробуем оценить вес
+    combined = user_state_data[uid].get('description', '') + " " + checklist
+    est = estimate_weight_with_gemini(combined)
+    if est is not None:
+        user_state_data[uid]['estimated_kg'] = float(est)
+        is_liters = bool(re.search(r"\b(литр|л\b|л\.)", (combined).lower()))
+        limit = MAX_ORDER_LITERS if is_liters else MAX_ORDER_KG
+        if est > limit:
+            bot.send_message(message.chat.id,
+                             f"⚠️ Оценочный вес — {est:.2f} кг, что превышает допустимый лимит ({limit} кг). "
+                             "К сожалению, бот не может принять такой заказ. Попробуйте уменьшить объём или разбить заказ.")
+            user_states.pop(uid, None)
+            user_state_data.pop(uid, None)
+            return
+        # спрашиваем цену — умно
+        user_states[uid] = "creating_order_price"
+        ask_price_message(uid, message.chat.id)
+        return
+    else:
+        # попросим вес вручную
+        user_states[uid] = "creating_order_weight"
+        bot.send_message(message.chat.id,
+                         "Не удалось автоматически определить вес. Укажите, пожалуйста, вес в килограммах (пример: 2.5) или напишите 'не знаю'.")
+
+
+
+
+# Ручной ввод веса (если Gemini не помог)
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "creating_order_weight")
+def handle_new_order_weight(message):
+    uid = message.from_user.id
+    txt = (message.text or "").strip().lower()
+    pending = user_state_data.get(uid)
+    if not pending:
+        bot.send_message(message.chat.id, "Сессия заказа не найдена. Запустите /order заново.")
+        user_states.pop(uid, None)
+        return
+
+    if txt in ("не знаю", "неизвестно"):
+        pending['estimated_kg'] = None
+    else:
+        val = parse_number_from_text(txt)
+        if val is None:
+            bot.send_message(message.chat.id, "Не понял количество. Введите, пожалуйста, число (в кг) или 'не знаю'.")
+            return
+        pending['estimated_kg'] = float(val)
+        # проверка лимита
+        combined_text = pending.get('description', '') + " " + (pending.get('checklist') or '')
+        is_liters = bool(re.search(r"\b(литр|л\b|л\.)", combined_text.lower()))
+        limit = MAX_ORDER_LITERS if is_liters else MAX_ORDER_KG
+        if val > limit:
+            bot.send_message(message.chat.id,
+                             f"⚠️ Указанный вес — {val:.2f} кг, превышает лимит ({limit} кг). "
+                             "К сожалению, бот не может принять такой заказ.")
+            user_states.pop(uid, None)
+            user_state_data.pop(uid, None)
+            return
+
+    # Просим цену — умно
+    user_states[uid] = "creating_order_price"
+    ask_price_message(uid, message.chat.id)
+
+
+# Цена: обработчик ввода цены
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "creating_order_price")
 def handle_new_order_price(message):
-    text = (message.text or "").strip()
-    try:
-        price = int(text)
-        if price <= 0:
-            bot.send_message(message.chat.id, "Цена должна быть положительной.")
-            return
-        user_state_data[message.from_user.id]['price'] = price
-        user_states[message.from_user.id] = "creating_order_type"
-        kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        kb.add(KeyboardButton("Онлайн (без локации)"))
-        kb.add(KeyboardButton("Оффлайн: отправить локацию", request_location=True))
-        bot.send_message(message.chat.id, "Если задача оффлайн — отправьте локацию, иначе нажмите 'Онлайн'.", reply_markup=kb)
-    except ValueError:
-        bot.send_message(message.chat.id, "Цена должна быть целым числом. Попробуйте снова.")
+    uid = message.from_user.id
+    if uid not in user_state_data:
+        bot.send_message(message.chat.id, "Сессия заказа не найдена. Запустите /order заново.")
+        user_states.pop(uid, None)
+        return
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "creating_order_type", content_types=['text','location'])
+    text = (message.text or "").strip()
+    price_num = parse_number_from_text(text)
+    if price_num is None:
+        bot.send_message(message.chat.id, "Пожалуйста, введите корректную числовую сумму (например: 150000).")
+        return
+
+    # Запрашиваем целое число сум — если пришёл float с дробной частью, просим ввести целое
+    if isinstance(price_num, float) and not price_num.is_integer():
+        bot.send_message(message.chat.id, "Пожалуйста, укажите сумму целым числом (без копеек), например: 150000.")
+        return
+
+    price_val = int(price_num)
+
+    # Проверяем минимальную цену для обычного задания
+    desc = (user_state_data.get(uid, {}).get('description') or "")
+    checklist = (user_state_data.get(uid, {}).get('checklist') or "")
+    combined = (desc + " " + checklist).strip()
+    is_purchase_or_delivery = looks_like_purchase(combined) or looks_like_delivery(combined)
+
+    if (not is_purchase_or_delivery) and price_val < MIN_TASK_PRICE:
+        bot.send_message(message.chat.id, f"Минимальная цена для обычных заданий — {MIN_TASK_PRICE} сум. Пожалуйста, укажите сумму, не менее {MIN_TASK_PRICE}.")
+        return
+
+    # Сохраняем цену и переходим к выбору типа (онлайн/локация)
+    user_state_data[uid]['price'] = price_val
+    user_states[uid] = "creating_order_type"
+
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.add(KeyboardButton("Онлайн (без локации)"))
+    kb.add(KeyboardButton("Оффлайн: отправить локацию", request_location=True))
+    bot.send_message(message.chat.id, "Если задача оффлайн — отправьте локацию, иначе нажмите 'Онлайн'.", reply_markup=kb)
+
+# Тип заказа (онлайн/локация) -> превью -> inline confirm/cancel
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "creating_order_type", content_types=['text', 'location'])
 def handle_new_order_type(message):
-    data = user_state_data.get(message.from_user.id, {})
+    uid = message.from_user.id
+    data = user_state_data.get(uid, {})
+    if not data:
+        bot.send_message(message.chat.id, "Сессия заказа не найдена. Запустите /order заново.")
+        user_states.pop(uid, None)
+        return
+
+    # Скрываем клавиатуру, чтобы не висел reply keyboard
+    try:
+        bot.send_message(message.chat.id, "Хорошо, формирую превью...", reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
+
     if message.content_type == 'location':
         lat, lon = message.location.latitude, message.location.longitude
         data['lat'] = lat; data['lon'] = lon
@@ -1870,19 +2276,62 @@ def handle_new_order_type(message):
         else:
             bot.send_message(message.chat.id, "Непонятный ввод. Отправьте локацию или нажмите 'Онлайн'.")
             return
+
     desc = data.get('description'); price = data.get('price'); lat = data.get('lat'); lon = data.get('lon')
-    preview = f"📌 Предпросмотр заказа\nОписание: {desc}\nЦена: {price} сум\n"
+    est = data.get('estimated_kg')
+    est_text = f"Оценочный вес: {est:.2f} кг\n" if est is not None else ""
+    preview = f"📌 Предпросмотр заказа\n\nОписание: {desc}\nЦена: {price} сум\n{est_text}"
     if lat is not None and lon is not None:
         preview += f"Адрес: lat={lat}, lon={lon}\n"
     else:
         preview += "Адрес: Онлайн\n"
-    tmp_key = f"tmp_order_{message.from_user.id}"
-    user_state_data[tmp_key] = {"description": desc, "price": price, "lat": lat, "lon": lon}
+
+    tmp_key = f"tmp_order_{uid}"
+    user_state_data[tmp_key] = {
+        "description": desc,
+        "price": price,
+        "lat": lat,
+        "lon": lon,
+        "estimated_kg": est,
+        "checklist": data.get('checklist'),
+        "created_at": data.get('created_at', now_iso())
+    }
+
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Подтвердить", callback_data=f"confirm_create:{message.from_user.id}"),
-           InlineKeyboardButton("Отменить", callback_data=f"cancel_create:{message.from_user.id}"))
+    kb.add(
+        InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_create:{uid}"),
+        InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_create:{uid}")
+    )
     bot.send_message(message.chat.id, preview, reply_markup=kb)
-    user_states.pop(message.from_user.id, None)
+
+    # Завершаем временное основное состояние
+    user_states.pop(uid, None)
+    # Удаляем основную временную запись (не tmp) — оставляем tmp_order_... до подтверждения
+    user_state_data.pop(uid, None)
+
+# Callback: подтверждение создания заказа
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("cancel_create:"))
+def callback_cancel_create(call):
+    try:
+        creator_id = int(call.data.split(":", 1)[1])
+    except Exception:
+        bot.answer_callback_query(call.id, "Некорректный вызов.")
+        return
+
+    tmp_key = f"tmp_order_{creator_id}"
+    # только автор может отменить
+    if call.from_user.id != creator_id:
+        bot.answer_callback_query(call.id, "Только автор может отменить заказ.")
+        return
+
+    user_state_data.pop(tmp_key, None)
+    bot.answer_callback_query(call.id, "Создание заказа отменено.")
+    try:
+        bot.send_message(creator_id, "Создание заказа отменено.")
+    except Exception:
+        pass
+
+# ---- END: расширенный New order flow ----
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("confirm_create:"))
 def callback_confirm_create(call):
@@ -1909,57 +2358,314 @@ def callback_confirm_create(call):
     # notify executors asynchronously
     threading.Thread(target=notify_executors_of_order, args=(order_id,), daemon=True).start()
 
-@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("cancel_create:"))
-def callback_cancel_create(call):
-    try:
-        creator_tg = int(call.data.split(":",1)[1])
-    except Exception:
-        bot.answer_callback_query(call.id, "Неверный callback.")
-        return
-    tmp_key = f"tmp_order_{creator_tg}"
-    user_state_data.pop(tmp_key, None)
-    bot.answer_callback_query(call.id, "Создание заказа отменено.")
-    bot.send_message(creator_tg, "Создание заказа отменено.")
+import html
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# /jobs - executor can list nearby available orders (based on their current location)
+# Вспомогательные функции для безопасной работы с sqlite3.Row и профилями
+def _row_val(row, name, default=None):
+    """Безопасный доступ к sqlite3.Row: возвращает default если колонки нет или значение is None."""
+    try:
+        if name in row.keys():
+            return row[name]
+    except Exception:
+        pass
+    return default
+
+def _normalize_coord(v):
+    """
+    Преобразует значение из БД в float координаты или None.
+    Поддерживает int/float/str. Всё остальное (включая '', 'None', 'null', '0') -> None.
+    (0 координату считаем невалидной — часто это placeholder в БД)
+    """
+    if v is None:
+        return None
+    # числовой тип
+    if isinstance(v, (int, float)):
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        # 0.0 трактуем как невалидную координату
+        return f if abs(f) > 1e-9 else None
+    # строка
+    try:
+        s = str(v).strip()
+        if s == "" or s.lower() in ("none", "null"):
+            return None
+        f = float(s)
+        return f if abs(f) > 1e-9 else None
+    except Exception:
+        return None
+
+def _has_coords(lat, lon):
+    """True если обе координаты валидны (float и не нулевые)."""
+    return (lat is not None) and (lon is not None)
+
+def _safe_profile_val(obj, key):
+    """
+    Получить значение профиля безопасно.
+    obj может быть dict (get_user возвращает dict), или sqlite3.Row, или None.
+    """
+    if not obj:
+        return None
+    try:
+        # dict-like
+        if isinstance(obj, dict):
+            return obj.get(key)
+        # sqlite3.Row supports keys()
+        try:
+            if key in obj.keys():
+                return obj[key]
+        except Exception:
+            pass
+        # fallback getattr
+        return getattr(obj, key, None)
+    except Exception:
+        return None
+
+
+
+
+import html
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# --- Вспомогательные функции (копировать вместе с обработчиком) ---
+
+def _row_val(row, name, default=None):
+    """
+    Безопасный доступ к sqlite3.Row: возвращает default если колонки нет.
+    Используйте для чтения строк из cur.fetchall() (sqlite3.Row не имеет .get()).
+    """
+    try:
+        if name in row.keys():
+            return row[name]
+    except Exception:
+        pass
+    return default
+
+def _normalize_coord(v):
+    """
+    Преобразует значение из БД в float координаты или None.
+    Поддерживает int/float/str. Всё остальное (включая '', 'None', 'null', '0', 0) -> None.
+    (0 считается невалидным placeholder-значением; если у вас реальные 0 координаты — уберите это правило)
+    """
+    if v is None:
+        return None
+    # Если уже число
+    if isinstance(v, (int, float)):
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        # Фильтруем нулевые placeholder-значения
+        if abs(f) < 1e-9:
+            return None
+        return f
+    # Строки
+    try:
+        s = str(v).strip()
+        if s == "" or s.lower() in ("none", "null"):
+            return None
+        f = float(s)
+        if abs(f) < 1e-9:
+            return None
+        return f
+    except Exception:
+        return None
+
+def _has_coords(lat, lon):
+    """True если обе координаты валидны (float и не нулевые)."""
+    return (lat is not None) and (lon is not None)
+
+def _safe_profile_val(obj, key):
+    """
+    Получить значение профиля безопасно.
+    obj может быть dict (get_user возвращает dict) или sqlite3.Row или None.
+    """
+    if not obj:
+        return None
+    try:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        # sqlite3.Row: поддерживает keys()
+        try:
+            if key in obj.keys():
+                return obj[key]
+        except Exception:
+            pass
+        # fallback getattr
+        return getattr(obj, key, None)
+    except Exception:
+        return None
+
+
+# --- Исправленный обработчик /jobs ---
 @bot.message_handler(commands=['jobs'])
 def list_jobs(message):
-    user = get_user(message.from_user.id)
-    lat = user['lat'] if user else None
-    lon = user['lon'] if user else None
+    # Получаем профиль исполнителя из БД и нормализуем его координаты
+    user_profile = get_user(message.from_user.id)
+    user_lat_raw = _safe_profile_val(user_profile, "lat")
+    user_lon_raw = _safe_profile_val(user_profile, "lon")
+    user_lat = _normalize_coord(user_lat_raw)
+    user_lon = _normalize_coord(user_lon_raw)
+
+    # Логируем координаты исполнителя (DEBUG) — это поможет в диагностике
+    try:
+        logger.debug("list_jobs: executor=%s raw=(%r,%r) norm=(%r,%r)",
+                     message.from_user.id, user_lat_raw, user_lon_raw, user_lat, user_lon)
+    except Exception:
+        pass
+
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, order_key, description, price_coins, lat, lon, radius_km FROM orders WHERE status='PUBLISHED' ORDER BY created_at DESC LIMIT 100")
+        cur.execute(
+            "SELECT id, order_key, description, price_coins, lat, lon, radius_km, creator_tg, created_at "
+            "FROM orders WHERE status='PUBLISHED' ORDER BY created_at DESC LIMIT 100"
+        )
         rows = cur.fetchall()
+
         found = 0
         for r in rows:
+            # безопасный доступ к полям sqlite3.Row
+            order_id = _row_val(r, "id")
+            order_key = _row_val(r, "order_key") or str(order_id)
+            desc = _row_val(r, "description") or ""
+            price = _row_val(r, "price_coins") or 0
+            raw_order_lat = _row_val(r, "lat")
+            raw_order_lon = _row_val(r, "lon")
+            radius_km = _row_val(r, "radius_km")
+            creator_tg = _row_val(r, "creator_tg")
+            created_at = _row_val(r, "created_at")
+
+            # нормализуем координаты заказа
+            order_lat = _normalize_coord(raw_order_lat)
+            order_lon = _normalize_coord(raw_order_lon)
+
+            # DEBUG лог: покажем, что реально лежит в БД и что получилось после нормализации
+            try:
+                logger.debug("list_jobs: order=%s raw_lat=%r raw_lon=%r -> norm=(%r,%r)",
+                             order_key, raw_order_lat, raw_order_lon, order_lat, order_lon)
+            except Exception:
+                pass
+
+            # вычисление расстояния и фильтр по радиусу (если у обоих есть корректные координаты)
             include = True
             dist_text = None
-            if r["lat"] is not None and r["lon"] is not None and lat is not None and lon is not None:
-                d = haversine_km(lat, lon, r["lat"], r["lon"])
-                if d > (r["radius_km"] or INITIAL_RADIUS_KM):
-                    include = False
-                else:
-                    dist_text = f"{d:.2f} км"
+            try:
+                if _has_coords(order_lat, order_lon) and _has_coords(user_lat, user_lon):
+                    d = haversine_km(float(user_lat), float(user_lon), float(order_lat), float(order_lon))
+                    radius = float(radius_km) if (radius_km is not None) else INITIAL_RADIUS_KM
+                    if d > radius:
+                        include = False
+                    else:
+                        dist_text = f"{d:.2f} км"
+            except Exception:
+                # при ошибке расчёта расстояния — не фильтруем, но не показываем расстояние
+                dist_text = None
+
             if not include:
                 continue
+
             found += 1
-            key = r["order_key"] or str(r["id"])
-            text = f"🆕 Заказ\n{r['description']}\nЦена: {r['price_coins']} сум\nID: `{key}`\n"
+
+            # Получаем данные заказчика (безопасно)
+            customer = None
+            try:
+                if creator_tg is not None:
+                    customer = get_user(creator_tg)
+            except Exception:
+                customer = None
+
+            full_name = _safe_profile_val(customer, "full_name")
+            username = _safe_profile_val(customer, "username")
+            phone = _safe_profile_val(customer, "phone")
+
+            # Попытаемся получить estimated_kg: сначала из row (если есть)
+            estimated = None
+            try:
+                if "estimated_kg" in r.keys():
+                    estimated = r["estimated_kg"]
+                else:
+                    # fallback: отдельный селект (на случай, если столбца в схеме нет)
+                    cur2 = conn.cursor()
+                    cur2.execute("SELECT estimated_kg FROM orders WHERE id=?", (order_id,))
+                    row2 = cur2.fetchone()
+                    if row2:
+                        try:
+                            estimated = row2["estimated_kg"]
+                        except Exception:
+                            estimated = row2[0] if len(row2) > 0 else None
+            except Exception:
+                estimated = None
+
+            # Формируем безопасный HTML-текст
+            parts = []
+            parts.append("🆕 <b>Заказ</b>")
+            parts.append(html.escape(desc) if desc else "—")
+            parts.append(f"<b>Цена:</b> {html.escape(str(price))} сум")
+            parts.append(f"<b>ID:</b> <code>{html.escape(str(order_key))}</code>")
+
+            if full_name:
+                parts.append(f"<b>Заказчик (ФИО):</b> {html.escape(str(full_name))}")
+            if username:
+                parts.append(f"<b>Username:</b> @{html.escape(str(username))}")
+            elif creator_tg:
+                parts.append(f"<b>User id:</b> <code>{html.escape(str(creator_tg))}</code>")
+
+            if phone:
+                parts.append(f"<b>Телефон:</b> {html.escape(str(phone))}")
+
+            if estimated is not None:
+                try:
+                    est_f = float(estimated)
+                    parts.append(f"<b>Оценочный вес:</b> {est_f:.2f} кг")
+                except Exception:
+                    pass
+
+            # Расстояние / адрес
             if dist_text:
-                text += f"Расстояние: {dist_text}\n"
+                parts.append(f"<b>Расстояние:</b> {html.escape(dist_text)}")
+            else:
+                if _has_coords(order_lat, order_lon):
+                    parts.append("<b>Адрес:</b> Оффлайн (координаты отправлены ниже)")
+                else:
+                    parts.append("<b>Адрес:</b> Онлайн")
+
+            if created_at:
+                parts.append(f"<b>Создан:</b> {html.escape(str(created_at))}")
+
+            text = "\n".join(parts)
+
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("Принять заказ", callback_data=f"accept:{key}"))
-            bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+            kb.add(InlineKeyboardButton("Принять заказ", callback_data=f"accept:{order_key}"))
+
+            # Отправляем сообщение (HTML-parse)
+            try:
+                bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                try:
+                    bot.send_message(message.chat.id, "\n".join(parts), reply_markup=kb)
+                except Exception:
+                    logger.exception("Failed to send job message")
+
+            # Если у заказа есть корректные координаты — отправляем геолокацию
+            if _has_coords(order_lat, order_lon):
+                try:
+                    bot.send_location(message.chat.id, float(order_lat), float(order_lon))
+                except Exception:
+                    logger.exception("Failed to send location for order %s", order_key)
+
         if found == 0:
             bot.send_message(message.chat.id, "Нет доступных заказов поблизости.")
     except Exception:
         logger.exception("list_jobs error")
         bot.send_message(message.chat.id, "Ошибка получения заказов.")
     finally:
-        conn.close()
-
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ---------------- Admin handlers ----------------
@@ -1967,7 +2673,7 @@ def list_jobs(message):
 @bot.message_handler(commands=['panel'])
 def admin_panel(message):
     if message.from_user.id not in ADMIN_IDS:
-        bot.send_message(message.chat.id, "Доступ запрещён.")
+        bot.send_message(message.chat.id, "Панель.")
         return
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("➕ Добавить фрилансера"), KeyboardButton("💰 Начислить сум"))
@@ -2071,7 +2777,7 @@ def admin_add_executor_execute(message):
     finally:
         user_states.pop(message.from_user.id, None)
 
-@bot.message_handler(func=lambda m: m.text == "💰 Начислить сумы")
+@bot.message_handler(func=lambda m: m.text == "💰 Начислить сум")
 def admin_add_coins_prompt(message):
     if message.from_user.id not in ADMIN_IDS:
         bot.send_message(message.chat.id, "Доступ запрещён.")
